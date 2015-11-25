@@ -1,0 +1,856 @@
+﻿package com.syntun.webget;
+
+import java.io.UnsupportedEncodingException;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Hashtable;
+import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+
+import org.apache.log4j.Logger;
+
+import com.syntun.putdata.InsertData;
+import com.syntun.replace.ReplacereplaceParameter;
+import com.syntun.tools.Base64;
+import com.syntun.tools.ConnADSL;
+import com.syntun.tools.ConnectSql;
+import com.syntun.tools.PatternMatcher;
+import com.syntun.tools.SleepUtil;
+import com.syntun.wetget.annotation.SetProperty;
+
+/**
+ * 解析抓取到的页面内容
+ * 
+ */
+@SetProperty(propertyVars = { "maximumPoolSize", "isContent", "sqlHost",
+		"upFile" }, propertyComment = "解析线程数量")
+public class ResolveWebPage {
+	/**
+	 * 存储抓取到的网页内容的列表
+	 */
+	private static LinkedList<Url> contentList = new LinkedList<Url>();
+	/**
+	 * commentPage所在的表
+	 */
+	public static String sqlHost = "192.168.0.69";
+	/**
+	 * 上传目录
+	 */
+	public static String upFile = "jiadian_data";
+
+	/**
+	 * 是否保存内容到文本
+	 */
+	private static boolean isContent = false;
+	/**
+	 * 线程池最大线程数量
+	 */
+	private static int maximumPoolSize = 15;
+	/**
+	 * 匹配内容的各站点列表
+	 */
+	private HashMap<Integer, LinkedList<LinkedList<HashMap<String, String>>>> hostPatternList = new HashMap<Integer, LinkedList<LinkedList<HashMap<String, String>>>>();
+	/**
+	 * 拼接模板集合
+	 */
+	private HashMap<Integer, HashMap<Integer, HashMap<String, String>>> cPurlHs = new HashMap<Integer, HashMap<Integer, HashMap<String, String>>>();
+
+	private static ResolveWebPage runParseObj;
+	/**
+	 * 保存内容解析对象
+	 */
+	private List<PageParse> parseConetntList = new ArrayList<PageParse>();
+	/**
+	 * 日志
+	 */
+	private Logger log = Logger.getLogger(ResolveWebPage.class);
+
+	private static List<FilterUrl> filterUrlList = new ArrayList<FilterUrl>();
+
+	/**
+	 * 构造方法
+	 * 
+	 * @param gp
+	 */
+	public ResolveWebPage() {
+		getFilterUrl();
+		GetWebPage.startGet();
+	}
+
+	private void getFilterUrl() {
+		Connection conn = ConnectSql.getConn();
+		try {
+			PreparedStatement pst = conn
+					.prepareStatement("SELECT `url_group`, `sort_id` FROM `filter_url`");
+			ResultSet rs = pst.executeQuery();
+			while (rs.next()) {
+				FilterUrl f = new FilterUrl();
+				f.setSortId(rs.getInt("sort_id"));
+				f.setUrlGroup(rs.getInt("url_group"));
+				filterUrlList.add(f);
+			}
+			rs.close();
+			pst.close();
+			ConnectSql.push(conn);
+		} catch (SQLException e) {
+			e.printStackTrace();
+		}
+	}
+
+	/**
+	 * 重置抓取解析
+	 */
+	public static synchronized void resetParse() {
+		if (runParseObj != null) {
+			runParseObj.resetParseContent();
+		}
+	}
+
+	private void resetParseContent() {
+		this.hostPatternList.clear();
+		// for(PageParse cp : this.parseConetntList) {
+		// Map<Integer, Map<Integer, Long>> pn = cp.getPatternMatcherNum();
+		// Connection conn = ConnectSql.getConn();
+		// String sql =
+		// "insert into pattern_match_info(pattern_url_id,pattern_id,match_date,match_num) values(?,?,?,?)";
+		// sql +=
+		// " ON DUPLICATE KEY UPDATE match_num=match_num+VALUES(match_num)";
+		// try {
+		// PreparedStatement pStmt = conn.prepareStatement(sql);
+		// int sqlNum = 0;
+		// for(Iterator<Entry<Integer, Map<Integer, Long>>> i =
+		// pn.entrySet().iterator(); i.hasNext(); ) {
+		// Entry<Integer, Map<Integer, Long>> e = i.next();
+		// int patternUrlId = e.getKey();
+		// Map<Integer, Long> patternNum = e.getValue();
+		//
+		// for(Iterator<Entry<Integer, Long>> iter =
+		// patternNum.entrySet().iterator(); iter.hasNext(); ) {
+		// Entry<Integer, Long> entry = iter.next();
+		// int patternId = entry.getKey();
+		// long matchNum = entry.getValue();
+		//
+		// pStmt.setInt(1, patternUrlId);
+		// pStmt.setInt(2, patternId);
+		// pStmt.setDate(3, new java.sql.Date(new Date().getTime()));
+		// pStmt.setLong(4, matchNum);
+		// sqlNum++;
+		// pStmt.addBatch();
+		// }
+		// }
+		// if(sqlNum>0) pStmt.executeBatch();
+		// pStmt.close();
+		// } catch (SQLException e1) {
+		// // TODO Auto-generated catch block
+		// e1.printStackTrace();
+		// }
+		// ConnectSql.push(conn);
+		// }
+		cPurlHs.clear();
+	}
+
+	/**
+	 * 获取拼接模版数据
+	 * 
+	 * @param patternUrlId
+	 * @return
+	 */
+	private synchronized HashMap<Integer, HashMap<String, String>> getPurlInfo(
+			int patternUrlId) {
+		HashMap<Integer, HashMap<String, String>> combinationUrlHs = null;
+		if (this.cPurlHs.containsKey(patternUrlId))
+			combinationUrlHs = this.cPurlHs.get(patternUrlId);
+		else {
+			Connection conn = ConnectSql.getConn();
+			try {
+				combinationUrlHs = new HashMap<Integer, HashMap<String, String>>();
+				Statement stmt = conn.createStatement();
+				String sql = "select * from purl_list where url_group="
+						+ patternUrlId;
+				ResultSet rs = stmt.executeQuery(sql);
+				ResultSetMetaData rsM = rs.getMetaData();
+				int filedNum = rsM.getColumnCount();
+				while (rs.next()) {
+					HashMap<String, String> info = new HashMap<String, String>();
+					for (int i = 1; i <= filedNum; i++) {
+						info.put(rsM.getColumnName(i), rs.getString(i));
+					}
+					combinationUrlHs.put(rs.getInt("id"), info);
+				}
+				this.cPurlHs.put(patternUrlId, combinationUrlHs);
+				rs.close();
+				stmt.close();
+				ConnectSql.push(conn);
+				return combinationUrlHs;
+			} catch (Exception sqle) {
+				ConnectSql.push(conn);
+				sqle.printStackTrace();
+				System.out.println("加载拼接模板失败！！");
+				System.exit(0);
+			}
+		}
+		return combinationUrlHs;
+	}
+
+	/**
+	 * 查看当前地址对象是否可以组合地址
+	 * 
+	 * @param urlInfo
+	 */
+	private synchronized void getCombinationUrl(Url urlInfo) {
+		List<Url> listUrl = new ArrayList<Url>();
+		// long start = System.currentTimeMillis();
+		HashMap<Integer, HashMap<String, String>> combinationUrlHs = this
+				.getPurlInfo(urlInfo.getPatternUrlId());
+		// System.out.println(Thread.currentThread().getName() + "获取拼接列表："
+		// + (System.currentTimeMillis() - start));
+		// long startend = System.currentTimeMillis();
+
+		for (Iterator<Entry<Integer, HashMap<String, String>>> iter = combinationUrlHs
+				.entrySet().iterator(); iter.hasNext();) {
+			Entry<Integer, HashMap<String, String>> e = iter.next();
+			HashMap<String, String> pInfo = e.getValue();
+			String generateSortId = pInfo.get("generate_sort_id");
+			String pUrlStr = pInfo.get("purl_str");
+			int patternUrlId = Integer.parseInt(pInfo.get("url_group"));
+			String sortId = "," + pInfo.get("sort_id") + ",";
+			int urlSortId = urlInfo.getSortId();
+			int sortIdIndex = sortId.indexOf("," + urlSortId + ",");
+			boolean isFind = false;
+			if (urlInfo.getPatternUrlId() == patternUrlId) {
+				if (sortIdIndex != -1 && urlSortId != 0)
+					isFind = true;
+			}
+			if (!isFind)
+				continue;
+			LinkedList<Url> urlList;
+			try {
+				urlList = ReplacereplaceParameter.execParameter(pUrlStr,
+						urlInfo, pInfo.get("exe_params"), generateSortId);
+			} catch (Exception ex) {
+				ex.printStackTrace();
+				urlList = null;
+			}
+
+			if (urlList != null && urlList.size() > 0) {
+				for (int i = 0; i < urlList.size(); i++) {
+					Url ui = urlList.get(i);
+					if (pInfo.containsKey("chart_set")
+							&& pInfo.get("chart_set") != null
+							&& pInfo.get("chart_set").trim() != "") {
+						ui.setChartSet(pInfo.get("chart_set"));
+					}
+					ui = UrlSupervise.handleUrlString(ui);
+					if (ui.getPatternUrlId() == 3000 && ui.getSortId() == 201) {
+						ui.setUrl(ui.getUrl().replace("?1=1", ""));
+					}
+					listUrl.add(ui);
+				}
+			}
+		}
+		// System.out.println(Thread.currentThread().getName() + "生产拼接地址:"
+		// + (System.currentTimeMillis() - startend));
+		if (listUrl.size() > 0) {
+			UrlSupervise.addUrlInfo(listUrl);
+		}
+	}
+
+	/**
+	 * 获取需要解析的内容
+	 * 
+	 * @return
+	 */
+	private static Url getPage() {
+		synchronized (contentList) {
+			int contentSize = ResolveWebPage.contentList.size();
+			if (contentSize == 0)
+				return null;
+			Url ui = ResolveWebPage.contentList.pollFirst();
+			return ui;
+		}
+	}
+
+	/**
+	 * 过滤产点中的字符
+	 * 
+	 * @param ui
+	 */
+	public void filterUrlStr(Url ui) {
+
+	}
+
+	public static HashMap<String, HashMap<String, String>> replaceMaps = new HashMap<String, HashMap<String, String>>();
+
+	public static void getRplaceMaps() {
+		Connection con = ConnectSql.getConn();
+		String sql = "SELECT `replace_group`, `replace_str`, `replace_val` FROM replace_str";
+		try {
+			PreparedStatement ps = con.prepareStatement(sql);
+			ResultSet rs = ps.executeQuery();
+			while (rs.next()) {
+				HashMap<String, String> maps = new HashMap<String, String>();
+				maps.put(rs.getString("replace_str"),
+						rs.getString("replace_val"));
+				replaceMaps.put(rs.getString("replace_group"), maps);
+			}
+			rs.close();
+			ps.close();
+			ConnectSql.push(con);
+		} catch (SQLException e) {
+			e.printStackTrace();
+		}
+
+	}
+
+	/**
+	 * 启动抓取
+	 */
+	public void startGetPage() {
+		getRplaceMaps();
+		ResolveWebPage.runParseObj = this;
+		for (int i = 0; i < ResolveWebPage.maximumPoolSize; i++) {
+			PageParse cp = new PageParse();
+			this.parseConetntList.add(cp);
+			new Thread(cp).start();
+		}
+	}
+
+	/**
+	 * 抓取线程将抓取到的信息将由解析线程来处理添加内容到解析列表
+	 * 
+	 * @param url
+	 * @param htmlContent
+	 */
+	public static boolean addContent(Url ui) {
+		ConnADSL.addStatsCount();
+		if (isContent) {
+			while (true) {
+				if (ContentManager.addContent(ui))
+					break;
+				else
+					SleepUtil.sleep(Math.round(300));
+			}
+			for (FilterUrl f : filterUrlList) {
+				if (f.getUrlGroup() == ui.getPatternUrlId()
+						&& f.getSortId() == ui.getSortId()) {
+					ui.setParseOver();
+					return true;
+				}
+			}
+		}
+		/*** 数量超过200暂停 ***/
+		if (contentList.size() > 200) {
+			System.err.println("contentList size oooo= " + contentList.size());
+			return false;
+		}
+		synchronized (contentList) {
+			contentList.add(ui);
+			return true;
+		}
+	}
+
+	/**
+	 * 获取当前需要解析的内容的数量.
+	 * 
+	 * @return
+	 */
+	public synchronized static int getContentSize() {
+		return contentList.size();
+	}
+
+	/**
+	 * 对内容进行解析的线程内部类
+	 */
+	class PageParse implements Runnable {
+
+		/**
+		 * 获取到的urlInfo对象
+		 */
+		private Url ui;
+
+		private PatternMatcher pm;
+		/**
+		 * 各站点正则匹配次数
+		 */
+		private Map<Integer, Map<Integer, Long>> patternMatcherNum = new Hashtable<Integer, Map<Integer, Long>>();
+
+		/**
+		 * 构造方法
+		 */
+		public PageParse() {
+			this.pm = new PatternMatcher();
+			System.out.println("ContentParse.....");
+		}
+
+		public Map<Integer, Map<Integer, Long>> getPatternMatcherNum() {
+			return this.patternMatcherNum;
+		}
+
+		@Override
+		public void run() {
+			while (true) {
+				// 获取已抓取的url地址及其返回的信息
+				ui = ResolveWebPage.getPage();
+//				long startTime = System.currentTimeMillis();
+				if (ui != null) {
+					// 对抓取的内容进行解析和正则匹配
+//					System.out.println(Thread.currentThread().getName()
+//							+ "开始解析url地址" + new Date());
+					this.pm.setReset();
+					this.pPage();
+					this.ui.setParseOver();
+//					System.out.println(Thread.currentThread().getName()
+//							+ "线程结束时间:"
+//							+ (System.currentTimeMillis() - startTime));
+				} else {
+//					System.out.println("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+//							+ ResolveWebPage.contentList.size());
+					try {
+						Thread.sleep(100);
+					} catch (InterruptedException e) {
+						e.printStackTrace();
+					}
+				}
+			}
+		}
+
+		/**
+		 * 解析内容
+		 */
+		public void pPage() {
+			if (this.ui.getHtmlContent() == null)
+				return;
+			try {
+				System.out.println("******当前解析地址：" + this.ui.getUrl()
+						+ " ******");
+				log.info(Thread.currentThread().getName() + ":"
+						+ this.ui.getUrl());
+				LinkedList<LinkedList<HashMap<String, String>>> gp = this
+						.getPatternList();
+				int combinationUrlNum = 0;
+				for (int i = 0; i < gp.size(); i++) {
+					HashMap<String, String> gpi = null;
+					LinkedList<HashMap<String, String>> lp = null;
+					lp = gp.get(i);
+					if (lp == null)
+						break;
+					gpi = lp.get(0);// 取出块匹配正则信息
+					int tableId = 0;
+					if (gpi.get("table_id") != null)
+						tableId = Integer.parseInt(gpi.get("table_id"));
+					boolean isMatcher = this.getFindMatcher(gpi);
+					List<String[]> gResult = new ArrayList<String[]>();
+//					System.out.println(Thread.currentThread().getName()
+//							+ "开始块匹配" + new Date());
+					if (isMatcher) {
+						 System.out.println("*** 解析块正则ID ：" + gpi.get("id")
+						 + " ***");
+						Long bTime = new Date().getTime();
+						gResult = pm.find(gpi.get("pattern_content"),
+								this.ui.getHtmlContent());
+						Long eTime = new Date().getTime();
+						log.info(Thread.currentThread().getName() + ": 块正则ID:"
+								+ gpi.get("id") + " 是否匹配成功："
+								+ (gResult.size() > 0) + "  执行毫秒："
+								+ (eTime - bTime));
+						if (gResult.size() > 0)
+							this.addPatternMatchNum(Integer.parseInt(gpi
+									.get("id")));
+					}
+//					System.out.println(Thread.currentThread().getName()
+//							+ "结束块匹配" + new Date());
+//					System.out.println(Thread.currentThread().getName()
+//							+ "开始子匹配" + new Date());
+					/*** 该匹配块是否能进行匹配 ***/
+					for (String[] gRow : gResult) {
+
+						/*** 取出相关数据库信息 ***/
+						String[] groupIndexArr = gpi.get("pattern_index")
+								.split(",");
+						String gpStr = "";
+
+						try {
+							for (int indexNum = 0; indexNum < groupIndexArr.length; indexNum++) {
+								gpStr += gRow[Integer
+										.parseInt(groupIndexArr[indexNum])];
+							}
+						} catch (Exception pe) {
+							log.info("[错误group_index无效]：ID为：" + gpi.get("id")
+									+ "的正则 url:" + this.ui.getUrl() + " e:"
+									+ pe.getMessage());
+							System.out.println("[错误group_index无效]：ID为："
+									+ gpi.get("id") + "的正则 url:"
+									+ this.ui.getUrl() + " e:"
+									+ pe.getMessage());
+							System.exit(0);
+						}
+
+						/*** 存储匹配结果 ***/
+						LinkedList<HashMap<String, String>> dataList = new LinkedList<HashMap<String, String>>();// 入库数据
+						LinkedList<String[]> urlList = new LinkedList<String[]>();// 需要抓取的URL
+						LinkedList<HashMap<String, String>> urlParamList = new LinkedList<HashMap<String, String>>();// 地址关联的数据
+						/*** 匹配出所有数据 ***/
+						for (int j = 1; j < lp.size(); j++) {
+
+							HashMap<String, String> dpi = lp.get(j);// 信息匹配
+							List<String[]> dResult = new ArrayList<String[]>();
+							Long bTime = new Date().getTime();
+//							System.out.println(Thread.currentThread().getName()
+//									+ "开始子匹配" + "~~~~~~~~~~~~~~~~~~"
+//									+ dpi.get("id") + new Date());
+							if (!dpi.get("parent_pattern_id").equals("0"))
+								dResult = pm.find(dpi.get("pattern_content"),
+										gpStr);// dpa.matcher(gpStr);
+							else
+								dResult = pm.find(dpi.get("pattern_content"),
+										this.ui.getHtmlContent());
+							Long eTime = new Date().getTime();
+							log.info(Thread.currentThread().getName()
+									+ ": 子正则:" + dpi.get("id") + "是否匹配成功："
+									+ (dResult.size() > 0) + " 执行毫秒："
+									+ (eTime - bTime));
+							if (dResult.size() > 0)
+								this.addPatternMatchNum(Integer.parseInt(dpi
+										.get("id")));
+
+							int z = 0;
+							for (String[] dRow : dResult) {
+								groupIndexArr = dpi.get("pattern_index").split(
+										",");
+								String pValue = "";
+								try {
+									for (int indexNum = 0; indexNum < groupIndexArr.length; indexNum++) {
+										pValue += dRow[Integer
+												.parseInt(groupIndexArr[indexNum])];
+									}
+								} catch (Exception pe) {
+									log.info("[错误group_index无效]：ID为："
+											+ dpi.get("id") + "的正则 url:"
+											+ this.ui.getUrl() + " e:"
+											+ pe.getMessage());
+									System.out.println("[错误group_index无效]：ID为："
+											+ dpi.get("id") + "的正则 url:"
+											+ this.ui.getUrl() + " e:"
+											+ pe.getMessage());
+									System.exit(0);
+								}
+
+								if ((dpi.get("table_id") != null)
+										|| dpi.get("is_save_page_data").equals(
+												"1")) {
+									HashMap<String, String> pData;
+									if (z < urlParamList.size())
+										pData = urlParamList.get(z);
+									else
+										pData = new HashMap<String, String>();
+									HashMap<String, String> tData = new HashMap<String, String>();
+									pData.put(dpi.get("col_name"), pValue);
+									if (dpi.get("is_save_page_data")
+											.equals("1")) {
+										if (z < urlParamList.size())
+											urlParamList.set(z, pData);
+										else
+											urlParamList.add(pData);
+									}
+
+									tData.put(dpi.get("col_name"), pValue);
+									if (dpi.get("table_id") != null)
+										dataList.add(tData);
+								}
+								if (dpi.get("is_get_url").equals("1")) {
+									urlList.add(new String[] { pValue,
+											dpi.get("generate_sort_id") });
+								}
+								z++;
+							}
+							// 记录未成功匹配的正则
+						}
+						if (urlParamList.size() > 0)
+							parallelSaveData(urlParamList, lp);
+
+						List<Url> listUrl = new ArrayList<Url>();
+						// long startUrlInsert = System.currentTimeMillis();
+						/*** 添加抓取地址 ***/
+						for (int u = 0; u < urlList.size(); u++) {
+							String[] urlInfoArr = urlList.get(u);
+							// (生成的url，生成的url的父级url，生成的sort_id类型)
+							Url nUi = new Url(urlInfoArr[0], this.ui.getUrl(),
+									Integer.parseInt(urlInfoArr[1]));
+							nUi.setHost(this.ui.getHost());
+							nUi.setPatternUrlId(this.ui.getPatternUrlId());
+							nUi.setCookie(this.ui.getCookie());
+							nUi.setChartSet(this.ui.getChartSet());
+							nUi.setFatherUrlId(this.ui.getGetUrlId());
+							nUi.addData(this.ui.getData());
+							int paramSize = urlParamList.size();
+							if (paramSize > 0) {
+								int paramIndex = u;
+								paramIndex = u >= paramSize ? paramSize - 1 : u;
+								nUi.addData(urlParamList.get(paramIndex));
+							}
+							nUi = UrlSupervise.handleUrlString(nUi);
+							if (nUi.getPatternUrlId() == 3000
+									&& nUi.getSortId() == 201) {
+								nUi.setUrl(nUi.getUrl().replace("?1=1", ""));
+							}
+							listUrl.add(nUi);
+						}
+//						long startUrlInsert = System.currentTimeMillis();
+//						System.out.println(Thread.currentThread().getName()
+//								+ "开始插入url地址" + new Date());
+						if (listUrl.size() > 0) {
+							UrlSupervise.addUrlInfo(listUrl);
+						}
+//						System.out
+//								.println(Thread.currentThread().getName()
+//										+ "线程插入url:"
+//										+ (System.currentTimeMillis() - startUrlInsert));
+//						long startpingjie = System.currentTimeMillis();
+						/*** 进行地址拼接 ***/
+						if (urlParamList.size() > 0) {
+							Url nUi = new Url(this.ui.getUrl(), this.ui,
+									this.ui.getSortId());
+							nUi.setPUrlId(this.ui.getPUrlId());
+							for (int u = 0; u < urlParamList.size(); u++) {
+								HashMap<String, String> savePageData = urlParamList
+										.get(u);
+								for (Iterator<Entry<String, String>> iter = savePageData
+										.entrySet().iterator(); iter.hasNext();) {
+									Entry<String, String> e = iter.next();
+									nUi.addData(e.getKey(), e.getValue());
+								}
+								getCombinationUrl(nUi);
+								combinationUrlNum++;
+							}
+						}
+//						System.out.println(Thread.currentThread().getName()
+//								+ "线程插入url:"
+//								+ (System.currentTimeMillis() - startpingjie));
+						if (tableId == 3) {
+							HashMap<String, String> map = new HashMap<String, String>();
+							map.put("url_data", ui.getDataStr());
+							map.put("url_type", 2 + "");
+							dataList.add(map);
+
+						}
+//						System.out.println(Thread.currentThread().getName()
+//								+ "开始入库" + new Date());
+						/*** 数据整理并入库 ***/
+						if (tableId != 0) {
+							if (UrlSupervise.isFirst == 0
+									|| UrlSupervise.isFirst == 1) {
+								InsertData tableObj = InsertData
+										.getTableObj(tableId);
+								tableObj.insertData(dataList, this.ui);
+							}
+						}
+//						System.out.println(Thread.currentThread().getName()
+//								+ "结束入库" + new Date());
+					}
+//					System.out.println(Thread.currentThread().getName()
+//							+ "结束子匹配" + new Date());
+				}
+				// 添加拼接
+				if (combinationUrlNum == 0)
+					getCombinationUrl(this.ui);
+				/********************** 输出解析完成 *********************************/
+
+			} catch (UnsupportedEncodingException e) {
+				e.printStackTrace();
+				System.exit(0);
+			} catch (SQLException e) {
+				e.printStackTrace();
+				System.exit(0);
+			} catch (Exception e) {
+				e.printStackTrace();
+				System.exit(0);
+			}
+			// 启动效率统计计数器
+			// CrawlerEnumerator.addEnumerator();
+		}
+
+		/**
+		 * 添加正则匹配计数
+		 * 
+		 * @param patternId
+		 */
+		private void addPatternMatchNum(int patternId) {
+			long matchNum = 1;
+			if (!patternMatcherNum.containsKey(this.ui.getPatternUrlId())) {
+				patternMatcherNum.put(this.ui.getPatternUrlId(),
+						new HashMap<Integer, Long>());
+			}
+			Map<Integer, Long> pNum = patternMatcherNum.get(this.ui
+					.getPatternUrlId());
+			if (pNum.containsKey(patternId))
+				matchNum += pNum.get(patternId);
+			pNum.put(patternId, matchNum);
+		}
+
+		/**
+		 * 添加数据到地址保存的数据,（该方法存在逻辑问题）
+		 * 
+		 * @param savePageDataList
+		 *            下级url需要保存的数据集合
+		 * @param addData
+		 *            需要添加到保存数据结果集中的数据
+		 * @param pl
+		 *            当前正在执行的正则组集合
+		 * @throws SQLException
+		 * @throws UnsupportedEncodingException
+		 */
+		private void parallelSaveData(
+				LinkedList<HashMap<String, String>> savePageDataList,
+				LinkedList<HashMap<String, String>> pl)
+				throws UnsupportedEncodingException, SQLException {
+			for (int z = 0; z < savePageDataList.size(); z++) {
+				if (z == 0)
+					continue;
+				// 比较字段是否一至,并查出不一至的字段
+				// LinkedList<String> nFiledNames = new LinkedList<String>();
+				HashMap<String, String> lastData = savePageDataList.get(z - 1);
+				HashMap<String, String> addData = savePageDataList.get(z);
+
+				ArrayList<String> parallelCols = this.getParallelCols(pl);
+
+				for (Iterator<Entry<String, String>> i = lastData.entrySet()
+						.iterator(); i.hasNext();) {
+					Entry<String, String> e = i.next();
+					if (!addData.containsKey(e.getKey())) {
+						if (parallelCols.indexOf(e.getKey()) != -1)
+							addData.put(e.getKey(), e.getValue());
+					}
+				}
+			}
+		}
+
+		/**
+		 * 检查可以平行的字段
+		 */
+		private ArrayList<String> getParallelCols(
+				LinkedList<HashMap<String, String>> pl) {
+			ArrayList<String> parallelCol = new ArrayList<String>();
+			for (int i = 1; i < pl.size(); i++) {
+				HashMap<String, String> info = pl.get(i);
+				if (info.get("is_save_page_data").equals("1"))
+					parallelCol.add(info.get("col_name"));
+			}
+			return parallelCol;
+		}
+
+		/**
+		 * 查看当前正则是否适合匹配当前页
+		 * 
+		 * @return Matcher
+		 */
+		private boolean getFindMatcher(HashMap<String, String> gpi) {
+			if (this.ui.getHtmlContent() == null)
+				return false;
+			String aboutPatternIds = "," + gpi.get("sort_id") + ",";
+			boolean isFind = false;
+			int aSearchIndex = aboutPatternIds.indexOf(","
+					+ this.ui.getSortId() + ",");
+			if (aSearchIndex != -1 && this.ui.getSortId() != 0)
+				isFind = true;
+			return isFind;
+		}
+
+		/**
+		 * 获取正则表达式列表
+		 * 
+		 * @return
+		 * @throws SQLException
+		 * @throws UnsupportedEncodingException
+		 */
+		private LinkedList<LinkedList<HashMap<String, String>>> getPatternList()
+				throws SQLException, UnsupportedEncodingException {
+			// 如果该正则不存在则从数据库中取出
+			if (!hostPatternList.containsKey(this.ui.getPatternUrlId())) {
+				Connection conn = ConnectSql.getConn();
+				Statement stmt = conn.createStatement();
+
+				String patternTableName = "";
+
+				String sql = "select pattern_table from init_url_list where url_group="
+						+ this.ui.getPatternUrlId();
+				ResultSet rs = stmt.executeQuery(sql);
+				if (rs.next())
+					patternTableName = rs.getString("pattern_table");
+				else
+					throw new SQLException("无法找到相关正则数据表!!");
+				sql = "select * from " + patternTableName
+						+ " where pattern_type!=-1 and url_group="
+						+ this.ui.getPatternUrlId()
+						+ " order by pattern_group,pattern_type";
+				// sql =
+				// "select * from pattern_list where pattern_type!=-1 and url_id="+this.ui.getPatternUrlId()+" order by pate_type_id,pattern_type";
+				rs = stmt.executeQuery(sql);
+				ResultSetMetaData rsm = rs.getMetaData();
+				LinkedList<LinkedList<HashMap<String, String>>> gp = new LinkedList<LinkedList<HashMap<String, String>>>();
+				LinkedList<HashMap<String, String>> pl = null;
+				while (rs.next()) {
+					HashMap<String, String> patternHs = new HashMap<String, String>();
+					if (rs.getInt("pattern_type") == 1) {
+						if (pl != null)
+							gp.add(pl);
+						pl = new LinkedList<HashMap<String, String>>();
+					}
+					for (int i = 1; i <= rsm.getColumnCount(); i++) {
+						String colValue = rs.getString(rsm.getColumnName(i));
+						if (colValue != null)
+							colValue = colValue.trim();
+						patternHs.put(rsm.getColumnName(i), colValue);
+					}
+					String patternStr = new String(Base64.decode(patternHs
+							.get("pattern_content"))).trim();
+					patternHs.put("pattern_content", patternStr);
+					if (pl != null) {
+						pl.add(patternHs);
+					}
+				}
+				if (pl != null) {
+					gp.add(pl);
+					hostPatternList.put(this.ui.getPatternUrlId(), gp);
+				}
+				stmt.close();
+				ConnectSql.push(conn);
+			}
+
+			if (!hostPatternList.containsKey(this.ui.getPatternUrlId()))
+				return new LinkedList<LinkedList<HashMap<String, String>>>();
+			else
+				return hostPatternList.get(this.ui.getPatternUrlId());
+		}
+	}
+
+	/**
+	 * 测试main
+	 * 
+	 * @param args
+	 */
+	public static void main(String[] args) {
+		String base64Codep;
+		try { // ImRlc2MiOiIoLio/KSjC+ikoLio/KSi89SkoLio/KaOsW14iXSo/Iig/Olx9LHxcfVxdKQ==
+			String str = "MP8RevFkyO8Q4P8xbMG8LX8gSPk8YvmcWPkc0Omv0OHQT";
+			base64Codep = new String(Base64.decode(str));
+			System.out.println(base64Codep);
+			System.out
+					.println(Base64
+							.encode("\"desc\":\"(.*?)(满)(.*?)(减)(.*?)，[^\"]*?\"(?:\\},|\\}\\])"
+									.getBytes()));
+		} catch (UnsupportedEncodingException e1) {
+			e1.printStackTrace();
+		}
+		System.exit(0);
+	}
+}
